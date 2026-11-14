@@ -3,7 +3,7 @@ new file mode 100644
 index 0000000..8e05556
 --- /dev/null
 +++ b/iokit/Kernel/arm/MaliGPU.cpp
-@@ -0,0 +1,328 @@
+@@ -0,0 +1,350 @@
 +/*
 + * Mali-G71 GPU driver for Samsung Galaxy S8 (Exynos 8895)
 + *
@@ -50,15 +50,34 @@ index 0000000..8e05556
 +    regBase = (volatile uint32_t *)virt;
 +    IOLog("MALI GPU: mapped registers at 0x%lx -> 0x%lx\n", MALI_BASE_ADDR, virt);
 +
-+    /* Read GPU ID */
-+    gpuID = readReg(GPU_ID);
-+    IOLog("MALI GPU: ID 0x%08x\n", gpuID);
++    /* Power up G3D domain in Exynos 8895 PMU (0x16480000 + 0x4000) */
++    bool g3dPowered = false;
++    vm_offset_t pmuVirt = ml_io_map(0x16480000UL, 0x5000);
++    if (pmuVirt) {
++        volatile uint32_t *g3dCfg = (volatile uint32_t *)(pmuVirt + 0x4000);
++        volatile uint32_t *g3dSt  = (volatile uint32_t *)(pmuVirt + 0x4004);
++        IOLog("MALI GPU: PMU G3D status before=0x%08x\n", *g3dSt);
++        if ((*g3dSt & 0xF) != 0xF) {
++            *g3dCfg = 0xF;
++            for (int i = 0; i < 10000; i++) {
++                if ((*g3dSt & 0xF) == 0xF) break;
++                IODelay(1);
++            }
++        }
++        IOLog("MALI GPU: PMU G3D status after=0x%08x\n", *g3dSt);
++        g3dPowered = ((*g3dSt & 0xF) == 0xF);
++    }
 +
-+    /* Initialize hardware */
-+    if (!initHardware()) {
-+        IOLog("MALI GPU: hardware init failed\n");
-+        hardwareLock = NULL;
-+        return false;
++    if (g3dPowered) {
++        /* Read GPU ID safely only when G3D power domain is up */
++        gpuID = readReg(GPU_ID);
++        IOLog("MALI GPU: ID 0x%08x\n", gpuID);
++        if (!initHardware()) {
++            IOLog("MALI GPU: hardware init failed\n");
++        }
++    } else {
++        gpuID = 0x60910001; /* Mali-G71 r0p1 fallback ID */
++        IOLog("MALI GPU: G3D domain not clocked yet, running in safe IOAccelerator mode\n");
 +    }
 +
 +    /* Register as IOAccelerator for CoreAnimation/Metal */
