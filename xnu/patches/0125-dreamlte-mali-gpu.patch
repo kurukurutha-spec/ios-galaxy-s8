@@ -22,7 +22,7 @@ index 0000000..8e05556
 +#define super IOService
 +OSDefineMetaClassAndStructors(MaliGPU, IOService);
 +
-+extern vm_offset_t ml_io_map(vm_offset_t phys, vm_size_t size);
++extern "C" vm_offset_t ml_io_map(vm_offset_t phys, vm_size_t size);
 +
 +bool
 +MaliGPU::start(IOService *provider)
