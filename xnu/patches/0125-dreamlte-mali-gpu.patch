@@ -1,6 +1,6 @@
 diff --git a/iokit/Kernel/arm/MaliGPU.cpp b/iokit/Kernel/arm/MaliGPU.cpp
 new file mode 100644
-index 0000000..077c9a8
+index 0000000..8e05556
 --- /dev/null
 +++ b/iokit/Kernel/arm/MaliGPU.cpp
 @@ -0,0 +1,328 @@
@@ -270,7 +270,7 @@ index 0000000..077c9a8
 +        return kIOReturnBadArgument;
 +    }
 +
-+    return super::externalMethod(selector, args, &methods[selector], this, NULL);
++    return super::externalMethod(selector, args, (IOExternalMethodDispatch *)&methods[selector], this, NULL);
 +}
 +
 +IOReturn
@@ -334,10 +334,10 @@ index 0000000..077c9a8
 +#endif /* ARM64_BOARD_CONFIG_A5XELTE || DREAMLTE */
 diff --git a/iokit/Kernel/arm/MaliGPU.h b/iokit/Kernel/arm/MaliGPU.h
 new file mode 100644
-index 0000000..f20a35a
+index 0000000..acb5058
 --- /dev/null
 +++ b/iokit/Kernel/arm/MaliGPU.h
-@@ -0,0 +1,129 @@
+@@ -0,0 +1,131 @@
 +/*
 + * Mali-G71 GPU driver for Samsung Galaxy S8 (Exynos 8895) - Header
 + *
@@ -351,6 +351,7 @@ index 0000000..f20a35a
 +
 +#if defined(ARM64_BOARD_CONFIG_A5XELTE) || defined(DREAMLTE)
 +#include <IOKit/IOService.h>
++#include <IOKit/IOInterruptEventSource.h>
 +#include <IOKit/IOUserClient.h>
 +#include <IOKit/IOMemoryDescriptor.h>
 +#include <IOKit/IOBufferMemoryDescriptor.h>
@@ -401,6 +402,7 @@ index 0000000..f20a35a
 + * MaliGPU - Main GPU driver service
 + */
 +class MaliGPU : public IOService {
++    friend class MaliGPUUserClient;
 +    OSDeclareDefaultStructors(MaliGPU);
 +
 +public:
