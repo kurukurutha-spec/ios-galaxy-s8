@@ -1,0 +1,496 @@
+diff --git a/iokit/Kernel/arm/MaliGPU.cpp b/iokit/Kernel/arm/MaliGPU.cpp
+new file mode 100644
+index 0000000..077c9a8
+--- /dev/null
++++ b/iokit/Kernel/arm/MaliGPU.cpp
+@@ -0,0 +1,328 @@
++/*
++ * Mali-G71 GPU driver for Samsung Galaxy S8 (Exynos 8895)
++ *
++ * Provides IOAccelerator-compatible GPU interface for iOS CoreAnimation/Metal.
++ * The Mali-G71 MP20 has 20 shader cores (5 cores per core group, 4 groups).
++ */
++#include "MaliGPU.h"
++
++#if defined(ARM64_BOARD_CONFIG_A5XELTE) || defined(DREAMLTE)
++#include <IOKit/IOLib.h>
++#include <IOKit/IOKitKeys.h>
++#include <IOKit/IOMemoryDescriptor.h>
++#include <libkern/c++/OSNumber.h>
++#include <libkern/c++/OSDictionary.h>
++
++#define super IOService
++OSDefineMetaClassAndStructors(MaliGPU, IOService);
++
++extern vm_offset_t ml_io_map(vm_offset_t phys, vm_size_t size);
++
++bool
++MaliGPU::start(IOService *provider)
++{
++    IOLog("MALI GPU: start\n");
++
++    if (!super::start(provider)) {
++        return false;
++    }
++
++    hardwareLock = IOLockAlloc();
++    if (!hardwareLock) {
++        IOLog("MALI GPU: failed to allocate lock\n");
++        return false;
++    }
++
++    /* Map GPU registers */
++    vm_offset_t virt = ml_io_map(MALI_BASE_ADDR, MALI_SIZE);
++    if (!virt) {
++        IOLog("MALI GPU: failed to map registers at 0x%lx\n", MALI_BASE_ADDR);
++        IOLockFree(hardwareLock);
++        return false;
++    }
++
++    regBase = (volatile uint32_t *)virt;
++    IOLog("MALI GPU: mapped registers at 0x%lx -> 0x%lx\n", MALI_BASE_ADDR, virt);
++
++    /* Read GPU ID */
++    gpuID = readReg(GPU_ID);
++    IOLog("MALI GPU: ID 0x%08x\n", gpuID);
++
++    /* Initialize hardware */
++    if (!initHardware()) {
++        IOLog("MALI GPU: hardware init failed\n");
++        hardwareLock = NULL;
++        return false;
++    }
++
++    /* Register as IOAccelerator for CoreAnimation/Metal */
++    setProperty("IOAcceleratorFamily", kOSBooleanTrue);
++    setProperty("IOMatchCategory", "IOAccelerator");
++    setProperty("PerformanceStatistics", kOSBooleanTrue);
++    setProperty("gpu-core-count", 20, 32);
++    setProperty("gpu-family-name", "Mali-G71");
++
++    registerService();
++    IOLog("MALI GPU: registered as IOAccelerator\n");
++
++    return true;
++}
++
++void
++MaliGPU::stop(IOService *provider)
++{
++    IOLog("MALI GPU: stop\n");
++
++    if (hardwareLock) {
++        IOLockFree(hardwareLock);
++        hardwareLock = NULL;
++    }
++
++    super::stop(provider);
++}
++
++IOService *
++MaliGPU::probe(IOService *provider, SInt32 *score)
++{
++    IOLog("MALI GPU: probe\n");
++    return super::probe(provider, score);
++}
++
++bool
++MaliGPU::initHardware()
++{
++    IOLog("MALI GPU: initializing hardware\n");
++
++    /* Soft reset */
++    resetGPU();
++
++    /* Clear pending interrupts */
++    writeReg(GPU_INT_CLEAR, 0xFFFFFFFF);
++    writeReg(GPU_INT_MASK, 0);
++
++    powerOn = true;
++    IOLog("MALI GPU: hardware initialized\n");
++    return true;
++}
++
++void
++MaliGPU::resetGPU()
++{
++    IOLog("MALI GPU: reset\n");
++
++    IOLockLock(hardwareLock);
++    writeReg(GPU_CONTROL, GPU_CMD_SOFT_RESET);
++
++    /* Wait for reset to complete */
++    for (int i = 0; i < 1000; i++) {
++        if ((readReg(GPU_STATUS) & 0x1) == 0) {
++            break;
++        }
++        IODelay(10);
++    }
++
++    IOLockUnlock(hardwareLock);
++}
++
++uint32_t
++MaliGPU::readReg(uint32_t offset)
++{
++    if (!regBase) {
++        return 0;
++    }
++    return regBase[offset / 4];
++}
++
++void
++MaliGPU::writeReg(uint32_t offset, uint32_t value)
++{
++    if (!regBase) {
++        return;
++    }
++    regBase[offset / 4] = value;
++}
++
++void
++MaliGPU::handleInterrupt()
++{
++    uint32_t status = readReg(GPU_INT_STAT);
++
++    if (status) {
++        IOLog("MALI GPU: interrupt 0x%08x\n", status);
++        writeReg(GPU_INT_CLEAR, status);
++    }
++}
++
++void
++MaliGPU::interruptHandler(OSObject *owner, IOService *provider, int source)
++{
++    MaliGPU *me = OSDynamicCast(MaliGPU, owner);
++    if (me) {
++        me->handleInterrupt();
++    }
++}
++
++bool
++MaliGPU::submitJob(uint32_t slot, uint64_t jobDescriptor, uint64_t affinity)
++{
++    if (slot >= MALI_NUM_JOB_SLOTS) {
++        return false;
++    }
++
++    IOLockLock(hardwareLock);
++
++    uint32_t base = JOB_SLOT_BASE + (slot * 0x80);
++
++    /* Check if job slot is idle */
++    uint32_t status = readReg(base + JS_STATUS);
++    if (status & 0x1) {
++        IOLog("MALI GPU: job slot %d busy\n", slot);
++        IOLockUnlock(hardwareLock);
++        return false;
++    }
++
++    /* Write job descriptor address */
++    writeReg(base + JS_HEAD_NEXT_LO, (uint32_t)(jobDescriptor & 0xFFFFFFFF));
++    writeReg(base + JS_HEAD_NEXT_HI, (uint32_t)(jobDescriptor >> 32));
++
++    /* Write affinity */
++    writeReg(base + JS_AFFINITY_NEXT_LO, (uint32_t)(affinity & 0xFFFFFFFF));
++    writeReg(base + JS_AFFINITY_NEXT_HI, (uint32_t)(affinity >> 32));
++
++    /* Start job */
++    writeReg(base + JS_COMMAND_NEXT, JS_CMD_START);
++
++    IOLog("MALI GPU: submitted job to slot %d, descriptor 0x%llx\n", slot, jobDescriptor);
++
++    IOLockUnlock(hardwareLock);
++    return true;
++}
++
++/* MaliGPUUserClient implementation */
++
++#undef super
++#define super IOUserClient
++OSDefineMetaClassAndStructors(MaliGPUUserClient, IOUserClient);
++
++bool
++MaliGPUUserClient::initWithTask(task_t owningTask, void *securityToken,
++                                UInt32 type, OSDictionary *properties)
++{
++    if (!super::initWithTask(owningTask, securityToken, type, properties)) {
++        return false;
++    }
++
++    clientTask = owningTask;
++    gpu = NULL;
++    contextID = 0;
++
++    return true;
++}
++
++bool
++MaliGPUUserClient::start(IOService *provider)
++{
++    if (!super::start(provider)) {
++        return false;
++    }
++
++    gpu = OSDynamicCast(MaliGPU, provider);
++    if (!gpu) {
++        return false;
++    }
++
++    return true;
++}
++
++void
++MaliGPUUserClient::stop(IOService *provider)
++{
++    super::stop(provider);
++}
++
++IOReturn
++MaliGPUUserClient::clientClose()
++{
++    terminate();
++    return kIOReturnSuccess;
++}
++
++IOReturn
++MaliGPUUserClient::externalMethod(uint32_t selector,
++                                  IOExternalMethodArguments *args,
++                                  IOExternalMethodDispatch *dispatch,
++                                  OSObject *target, void *reference)
++{
++    static const IOExternalMethodDispatch methods[4] = {
++        { (IOExternalMethodAction)&MaliGPUUserClient::sGetGPUInfo, 0, 0, 2, 0 },
++        { (IOExternalMethodAction)&MaliGPUUserClient::sAllocateContext, 0, 0, 1, 0 },
++        { (IOExternalMethodAction)&MaliGPUUserClient::sSubmitJob, 3, 0, 0, 0 },
++        { (IOExternalMethodAction)&MaliGPUUserClient::sMapMemory, 2, 0, 1, 0 },
++    };
++
++    if (selector >= 4) {
++        return kIOReturnBadArgument;
++    }
++
++    return super::externalMethod(selector, args, &methods[selector], this, NULL);
++}
++
++IOReturn
++MaliGPUUserClient::sGetGPUInfo(MaliGPUUserClient *target, void *ref,
++                               IOExternalMethodArguments *args)
++{
++    if (!target || !target->gpu) {
++        return kIOReturnNotAttached;
++    }
++
++    args->scalarOutput[0] = target->gpu->gpuID;
++    args->scalarOutput[1] = 20; /* core count */
++
++    return kIOReturnSuccess;
++}
++
++IOReturn
++MaliGPUUserClient::sAllocateContext(MaliGPUUserClient *target, void *ref,
++                                    IOExternalMethodArguments *args)
++{
++    if (!target) {
++        return kIOReturnNotAttached;
++    }
++
++    /* Simple context allocation - just return an ID */
++    static uint32_t nextContext = 1;
++    target->contextID = nextContext++;
++
++    args->scalarOutput[0] = target->contextID;
++
++    return kIOReturnSuccess;
++}
++
++IOReturn
++MaliGPUUserClient::sSubmitJob(MaliGPUUserClient *target, void *ref,
++                              IOExternalMethodArguments *args)
++{
++    if (!target || !target->gpu) {
++        return kIOReturnNotAttached;
++    }
++
++    uint32_t slot = (uint32_t)args->scalarInput[0];
++    uint64_t descriptor = args->scalarInput[1];
++    uint64_t affinity = args->scalarInput[2];
++
++    if (target->gpu->submitJob(slot, descriptor, affinity)) {
++        return kIOReturnSuccess;
++    }
++
++    return kIOReturnError;
++}
++
++IOReturn
++MaliGPUUserClient::sMapMemory(MaliGPUUserClient *target, void *ref,
++                              IOExternalMethodArguments *args)
++{
++    /* Memory mapping would be implemented here */
++    return kIOReturnUnsupported;
++}
++
++#endif /* ARM64_BOARD_CONFIG_A5XELTE || DREAMLTE */
+diff --git a/iokit/Kernel/arm/MaliGPU.h b/iokit/Kernel/arm/MaliGPU.h
+new file mode 100644
+index 0000000..f20a35a
+--- /dev/null
++++ b/iokit/Kernel/arm/MaliGPU.h
+@@ -0,0 +1,129 @@
++/*
++ * Mali-G71 GPU driver for Samsung Galaxy S8 (Exynos 8895) - Header
++ *
++ * This driver presents the Mali-G71 GPU as an IOAccelerator-compatible
++ * interface for iOS. It provides GPU access for CoreAnimation/Metal rendering.
++ */
++#ifndef _MALI_GPU_H
++#define _MALI_GPU_H
++
++#include <pexpert/arm64/board_config.h>
++
++#if defined(ARM64_BOARD_CONFIG_A5XELTE) || defined(DREAMLTE)
++#include <IOKit/IOService.h>
++#include <IOKit/IOUserClient.h>
++#include <IOKit/IOMemoryDescriptor.h>
++#include <IOKit/IOBufferMemoryDescriptor.h>
++#include <libkern/c++/OSObject.h>
++
++/* Mali-G71 MP20 hardware registers (Exynos 8895) */
++#define MALI_BASE_ADDR          0x11800000UL
++#define MALI_SIZE               0x5000UL
++
++/* Mali register offsets */
++#define GPU_ID                  0x000
++#define GPU_CONTROL             0x020
++#define GPU_STATUS              0x024
++#define GPU_READY               0x028
++#define GPU_INT_RAWSTAT         0x2C0
++#define GPU_INT_CLEAR           0x2C4
++#define GPU_INT_MASK            0x2C8
++#define GPU_INT_STAT            0x2CC
++
++/* Job slot registers */
++#define JOB_SLOT_BASE           0x800
++#define JS_HEAD_NEXT_LO         0x000
++#define JS_HEAD_NEXT_HI         0x004
++#define JS_TAIL_NEXT_LO         0x008
++#define JS_TAIL_NEXT_HI         0x00C
++#define JS_AFFINITY_NEXT_LO     0x010
++#define JS_AFFINITY_NEXT_HI     0x014
++#define JS_CONFIG_NEXT          0x018
++#define JS_COMMAND_NEXT         0x020
++#define JS_STATUS               0x024
++
++/* GPU commands */
++#define GPU_CMD_SOFT_RESET      0x01
++#define GPU_CMD_HARD_RESET      0x02
++#define GPU_CMD_CLEAR_FAULT     0x04
++
++/* Job commands */
++#define JS_CMD_NOOP             0x00
++#define JS_CMD_START            0x01
++#define JS_CMD_SOFT_STOP        0x02
++#define JS_CMD_HARD_STOP        0x03
++#define JS_CMD_FLUSH_CACHE      0x04
++
++#define MALI_NUM_JOB_SLOTS      3
++#define MALI_MAX_CONTEXTS       256
++
++/*
++ * MaliGPU - Main GPU driver service
++ */
++class MaliGPU : public IOService {
++    OSDeclareDefaultStructors(MaliGPU);
++
++public:
++    virtual bool start(IOService *provider) APPLE_KEXT_OVERRIDE;
++    virtual void stop(IOService *provider) APPLE_KEXT_OVERRIDE;
++    virtual IOService *probe(IOService *provider, SInt32 *score) APPLE_KEXT_OVERRIDE;
++
++    /* Hardware control */
++    bool initHardware();
++    void resetGPU();
++    uint32_t readReg(uint32_t offset);
++    void writeReg(uint32_t offset, uint32_t value);
++
++    /* Interrupt handling */
++    static void interruptHandler(OSObject *owner, IOService *provider, int source);
++    void handleInterrupt();
++
++    /* Job management */
++    bool submitJob(uint32_t slot, uint64_t jobDescriptor, uint64_t affinity);
++
++private:
++    IOMemoryMap *gpuRegs;
++    volatile uint32_t *regBase;
++    IOWorkLoop *workLoop;
++    IOInterruptEventSource *interruptSource;
++    IOLock *hardwareLock;
++
++    uint32_t gpuID;
++    bool powerOn;
++};
++
++/*
++ * MaliGPUUserClient - User space interface
++ */
++class MaliGPUUserClient : public IOUserClient {
++    OSDeclareDefaultStructors(MaliGPUUserClient);
++
++public:
++    virtual bool initWithTask(task_t owningTask, void *securityToken, UInt32 type,
++                             OSDictionary *properties) APPLE_KEXT_OVERRIDE;
++    virtual bool start(IOService *provider) APPLE_KEXT_OVERRIDE;
++    virtual void stop(IOService *provider) APPLE_KEXT_OVERRIDE;
++    virtual IOReturn clientClose() APPLE_KEXT_OVERRIDE;
++
++    virtual IOReturn externalMethod(uint32_t selector, IOExternalMethodArguments *args,
++                                   IOExternalMethodDispatch *dispatch,
++                                   OSObject *target, void *reference) APPLE_KEXT_OVERRIDE;
++
++protected:
++    static IOReturn sGetGPUInfo(MaliGPUUserClient *target, void *ref,
++                               IOExternalMethodArguments *args);
++    static IOReturn sAllocateContext(MaliGPUUserClient *target, void *ref,
++                                    IOExternalMethodArguments *args);
++    static IOReturn sSubmitJob(MaliGPUUserClient *target, void *ref,
++                              IOExternalMethodArguments *args);
++    static IOReturn sMapMemory(MaliGPUUserClient *target, void *ref,
++                              IOExternalMethodArguments *args);
++
++private:
++    MaliGPU *gpu;
++    task_t clientTask;
++    uint32_t contextID;
++};
++
++#endif /* ARM64_BOARD_CONFIG_A5XELTE || DREAMLTE */
++#endif /* _MALI_GPU_H */
+diff --git a/iokit/KernelConfigTables.cpp b/iokit/KernelConfigTables.cpp
+index 9a35982..92b8c2c 100644
+--- a/iokit/KernelConfigTables.cpp
++++ b/iokit/KernelConfigTables.cpp
+@@ -89,6 +89,13 @@ const char * gIOKernelConfigTables =
+     "     'IOProviderClass' = IOResources;"
+     "     'IOMatchCategory' = SweetHIDTouch;"
+     "   },"
++#if defined(ARM64_BOARD_CONFIG_A5XELTE)
++    "   {"
++    "     'IOClass'         = MaliGPU;"
++    "     'IOProviderClass' = IOResources;"
++    "     'IOMatchCategory' = IOAccelerator;"
++    "   },"
++#endif
+ #if !defined(ARM64_BOARD_CONFIG_A5XELTE) || 1  /* S8: MAX77865 */
+     "   {"
+     "     'IOClass'         = SweetBattery;"
+diff --git a/iokit/conf/files.arm64 b/iokit/conf/files.arm64
+index acc9ae0..89555eb 100644
+--- a/iokit/conf/files.arm64
++++ b/iokit/conf/files.arm64
+@@ -20,3 +20,4 @@ iokit/Kernel/arm/hid/SweetHID.cpp                                optional iokitc
+ iokit/Kernel/arm/hid/IOHIDEvent.cpp                              optional iokitcpp
+ iokit/Kernel/arm/hid/IOHIDEventServiceQueue.cpp                  optional iokitcpp
+ iokit/Kernel/arm/hid/IOHIDEventServiceUserClient.cpp             optional iokitcpp
++iokit/Kernel/arm/MaliGPU.cpp                                     optional iokitcpp
