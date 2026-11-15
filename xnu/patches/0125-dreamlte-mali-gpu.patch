@@ -1001,3 +1001,31 @@ index 0000000..0000000
  iokit/Kernel/IOCommandPool.cpp              standard
 
 
+diff --git a/iokit/bsddev/IOKitBSDInit.cpp b/iokit/bsddev/IOKitBSDInit.cpp
+index b6ba676..8626e0f 100644
+--- a/iokit/bsddev/IOKitBSDInit.cpp
++++ b/iokit/bsddev/IOKitBSDInit.cpp
+@@ -71,6 +71,10 @@ extern boolean_t cpuid_vmm_present(void);
+ extern void a5xelte_emmc_probe(void);
+ extern void a5xelte_keys_init(void);
+ extern void a5xelte_touch_probe(void);
++#if defined(DREAMLTE)
++extern void dreamlte_mali_init(void);
++extern void MaliGPUStart(void);
++#endif
+ #endif
+ 
+ #define ROUNDUP(a, b) (((a) + ((b) - 1)) & (~((b) - 1)))
+@@ -774,6 +778,12 @@ IOFindBSDRoot( char * rootName, unsigned int rootNameSize,
+ #if defined(ARM64_BOARD_CONFIG_A5XELTE)
+ 	a5xelte_keys_init();
+ 	a5xelte_touch_probe();
++#if defined(DREAMLTE)
++	/* Initialize Mali-G71 MP20 GPU hardware (step 1-6 in kernel) */
++	dreamlte_mali_init();
++	/* Register HakiosMali IOKit service (step 7-8 in IOKit) */
++	MaliGPUStart();
++#endif
+ 	{
+ 	uint32_t emmcprobe = 0;
+ 	PE_parse_boot_argn("emmcprobe", &emmcprobe, sizeof(emmcprobe));
