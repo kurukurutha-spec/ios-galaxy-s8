@@ -1896,7 +1896,7 @@ index 0000000..337af76
 +
 +#endif /* HAKIOS_MALI_VA_H */
 diff --git a/osfmk/conf/files.arm64 b/osfmk/conf/files.arm64
-index b0dad49..b24dbca 100644
+index b0dad49..53831d0 100644
 --- a/osfmk/conf/files.arm64
 +++ b/osfmk/conf/files.arm64
 @@ -105,3 +105,5 @@ osfmk/arm64/machine_remote_time.c optional config_mach_bridge_recv_time
@@ -1904,4 +1904,4 @@ index b0dad49..b24dbca 100644
  
  osfmk/arm/counter.c	standard
 +
-+osfmk/arm64/dreamlte_mali.c optional config_a5xelte
++osfmk/arm64/dreamlte_mali.c standard
