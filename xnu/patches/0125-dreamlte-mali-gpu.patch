@@ -489,10 +489,10 @@ index 5fb0a52..d07c834 100644
 +iokit/Kernel/arm/MaliGPU.cpp			standard
 diff --git a/osfmk/arm64/dreamlte_mali.c b/osfmk/arm64/dreamlte_mali.c
 new file mode 100644
-index 0000000..31003c9
+index 0000000..cfc2ebf
 --- /dev/null
 +++ b/osfmk/arm64/dreamlte_mali.c
-@@ -0,0 +1,523 @@
+@@ -0,0 +1,526 @@
 +/*
 + * Mali-G71 MP20 kernel driver for Samsung Galaxy S8 (Exynos 8895)
 + *
@@ -512,10 +512,13 @@ index 0000000..31003c9
 +#include <kern/clock.h>
 +#include <kern/locks.h>
 +#include <kern/thread.h>
-+#include <libkern/libkern.h>
++#include <kern/kalloc.h>
 +#include <mach/mach_time.h>
 +#include <mach/mach_types.h>
-+#include <sys/systm.h>
++#include <arm/pmap/pmap.h>	/* kvtophys, phystokv: not reached through <vm/pmap.h> */
++
++/* osfmk cannot take <sys/systm.h>: it redefines daddr_t, dev_t, clock_t */
++extern int printf(const char *, ...);
 +#include <vm/vm_kern.h>
 +
 +/* Exynos 8895 hardware addresses */
