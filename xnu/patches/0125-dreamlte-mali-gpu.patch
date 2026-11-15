@@ -1,9 +1,498 @@
+diff --git a/iokit/Kernel/arm/MaliGPU.cpp b/iokit/Kernel/arm/MaliGPU.cpp
+new file mode 100644
+index 0000000..f143f7f
+--- /dev/null
++++ b/iokit/Kernel/arm/MaliGPU.cpp
+@@ -0,0 +1,392 @@
++/*
++ * MaliGPU IOKit service for Samsung Galaxy S8 (dreamlte)
++ * Adapted from Scion Project's HakiosMali (hakios.mali.cpp)
++ * License: Apple Public Source License 2.0 (as original)
++ */
++
++#include <IOKit/IOLib.h>
++#include <IOKit/IOLocks.h>
++#include <IOKit/IOKitKeys.h>
++#include <IOKit/IOPlatformExpert.h>
++#include <IOKit/IOService.h>
++#include <IOKit/IOUserClient.h>
++#include <IOKit/IOBufferMemoryDescriptor.h>
++#include <IOKit/IOSubMemoryDescriptor.h>
++#include <kern/clock.h>
++#include <mach/mach_time.h>
++#include <mach/vm_param.h>
++#include <sys/systm.h>
++#include <pexpert/pexpert.h>
++
++#include "MaliGPU.h"
++
++#ifdef __cplusplus
++extern "C" {
++#endif
++
++/* C kernel driver functions */
++bool dreamlte_mali_ready(void);
++bool dreamlte_mali_parameter(uint32_t which, uint64_t *value);
++uint64_t dreamlte_mali_address(uint64_t size, bool executable);
++bool dreamlte_mali_map(uint64_t gpu, uint64_t phys);
++void dreamlte_mali_mapped(void);
++void dreamlte_mali_unmap(uint64_t gpu, uint64_t size);
++uint32_t dreamlte_mali_submit(uint64_t chain, bool fragment);
++uint64_t dreamlte_mali_enqueue(uint64_t chain, bool fragment);
++bool dreamlte_mali_wait(uint64_t seq, uint64_t timeout_ns);
++void dreamlte_mali_init(void);
++
++void MaliGPUStart(void);
++void FlushPoC_DcacheRegion(vm_offset_t va, size_t length);
++
++uint32_t gMaliClients, gMaliBuffers, gMaliSubmits, gMaliFailed, gMaliShown;
++struct mali_made { uint64_t address, size; uint32_t asked, flags; };
++struct mali_made gMaliMade[32];
++
++#ifdef __cplusplus
++}
++#endif
++
++/* Linux panfrost DRM API request numbers */
++enum {
++    kDrmGemClose            = 0x09,
++    kPanfrostSubmit         = 0x40,
++    kPanfrostWaitBO         = 0x41,
++    kPanfrostCreateBO       = 0x42,
++    kPanfrostMmapBO         = 0x43,
++    kPanfrostGetParam       = 0x44,
++    kPanfrostGetBOOffset    = 0x45,
++    kPanfrostMadvise        = 0x48,
++    kMaliGPUSurfaceSeq      = 0x7c,
++    kMaliGPUWait            = 0x7d,
++    kMaliGPUSurface         = 0x7e,
++    kMaliGPUShow            = 0x7f,
++};
++
++/* Panfrost DRM structures */
++struct drm_gem_close {
++    uint32_t handle, pad;
++};
++
++struct drm_panfrost_submit {
++    uint64_t jc;
++    uint64_t in_syncs;
++    uint32_t in_sync_count;
++    uint32_t out_sync;
++    uint64_t bo_handles;
++    uint32_t bo_handle_count;
++    uint32_t requirements;
++};
++#define PANFROST_JD_REQ_FS (1u << 0)
++
++struct drm_panfrost_wait_bo {
++    uint32_t handle, pad;
++    int64_t timeout_ns;
++};
++
++struct drm_panfrost_create_bo {
++    uint32_t size, flags, handle, pad;
++    uint64_t offset;
++};
++#define PANFROST_BO_NOEXEC (1u << 0)
++#define PANFROST_BO_HEAP (1u << 1)
++
++struct drm_panfrost_mmap_bo {
++    uint32_t handle, flags;
++    uint64_t offset;
++};
++
++struct drm_panfrost_get_param {
++    uint32_t param, pad;
++    uint64_t value;
++};
++
++struct drm_panfrost_get_bo_offset {
++    uint32_t handle, pad;
++    uint64_t offset;
++};
++
++struct drm_panfrost_madvise {
++    uint32_t handle, madv, retained;
++};
++
++static IOLock *gMaliLock;
++
++OSDefineMetaClassAndStructors(MaliGPU, IOService);
++
++bool MaliGPU::start(IOService *provider) {
++    if (!IOService::start(provider)) {
++        return false;
++    }
++    setProperty(kIOUserClientClassKey, "MaliGPUUserClient");
++    setName("HakiosMali");   /* userland looks for this name: hakios.drm.c, inject.c */
++    registerService();
++    return true;
++}
++
++void MaliGPUStart(void) {
++    IOService *provider = IOService::getPlatform();
++    MaliGPU *gpu;
++
++    gMaliLock = IOLockAlloc();
++    gpu = OSTypeAlloc(MaliGPU);
++    if (gpu == NULL || provider == NULL || !gpu->init() || !gpu->attach(provider)) {
++        OSSafeReleaseNULL(gpu);
++        IOLog("HakiosMali: cannot create service\n");
++        return;
++    }
++    if (!gpu->start(provider)) {
++        gpu->detach(provider);
++        IOLog("HakiosMali: service did not start\n");
++    }
++    gpu->release();
++    IOLog("HakiosMali: Mali-G71 MP20 ready for programs\n");
++}
++
++OSDefineMetaClassAndStructors(MaliGPUUserClient, IOUserClient);
++
++bool MaliGPUUserClient::start(IOService *provider) {
++    if (!dreamlte_mali_ready() || !IOUserClient::start(provider)) {
++        IOLog("MaliGPU: client could not start\n");
++        return false;
++    }
++    IOLog("MaliGPU: client opened GPU\n");
++    OSIncrementAtomic((SInt32 *)&gMaliClients);
++    fBuffers = IONewZero(struct mali_buffer, MALI_BUFFERS);
++    return fBuffers != NULL;
++}
++
++struct mali_buffer *MaliGPUUserClient::buffer(uint32_t handle) {
++    if (handle == 0 || handle > MALI_BUFFERS || fBuffers[handle - 1].memory == NULL) {
++        return NULL;
++    }
++    return &fBuffers[handle - 1];
++}
++
++void MaliGPUUserClient::freeBuffer(struct mali_buffer *b) {
++    if (b->last_seq != 0) {
++        (void)dreamlte_mali_wait(b->last_seq, 2ull * NSEC_PER_SEC);
++    }
++    dreamlte_mali_unmap(b->address, b->size);
++    b->memory->release();
++    bzero(b, sizeof(*b));
++}
++
++IOReturn MaliGPUUserClient::clientClose(void) {
++    IOLockLock(gMaliLock);
++    for (uint32_t i = 0; fBuffers != NULL && i < MALI_BUFFERS; i++) {
++        if (fBuffers[i].memory != NULL) {
++            freeBuffer(&fBuffers[i]);
++        }
++    }
++    IOLockUnlock(gMaliLock);
++    if (fSubmits != 0) {
++        IOLog("MaliGPU: client closed after %u job chains, %u failed\n", fSubmits, fFailed);
++    }
++    terminate();
++    return kIOReturnSuccess;
++}
++
++void MaliGPUUserClient::free(void) {
++    if (fBuffers != NULL) {
++        IODelete(fBuffers, struct mali_buffer, MALI_BUFFERS);
++        fBuffers = NULL;
++    }
++    IOUserClient::free();
++}
++
++IOReturn MaliGPUUserClient::clientMemoryForType(UInt32 type, IOOptionBits *options, IOMemoryDescriptor **memory) {
++    struct mali_buffer *b;
++    IOReturn ret = kIOReturnBadArgument;
++
++    IOLockLock(gMaliLock);
++    b = buffer(type);
++    if (b != NULL) {
++        b->memory->retain();
++        *memory = b->memory;
++        *options = 0;
++        ret = kIOReturnSuccess;
++    }
++    IOLockUnlock(gMaliLock);
++    return ret;
++}
++
++IOReturn MaliGPUUserClient::externalMethod(uint32_t selector, IOExternalMethodArguments *args,
++    IOExternalMethodDispatch *dispatch, OSObject *target, void *reference) {
++    union {
++        struct drm_gem_close close;
++        struct drm_panfrost_submit submit;
++        struct drm_panfrost_wait_bo wait;
++        struct drm_panfrost_create_bo create;
++        struct drm_panfrost_mmap_bo mmap;
++        struct drm_panfrost_get_param param;
++        struct drm_panfrost_get_bo_offset offset;
++        struct drm_panfrost_madvise madvise;
++    } r;
++    size_t size = args->structureInputSize;
++    struct mali_buffer *b;
++    IOReturn ret = kIOReturnSuccess;
++
++    if (args->structureInput == NULL || size > sizeof(r) || fBuffers == NULL) {
++        return kIOReturnBadArgument;
++    }
++    if (!dreamlte_mali_ready()) {
++        return kIOReturnNotReady;
++    }
++    bzero(&r, sizeof(r));
++    memcpy(&r, args->structureInput, size);
++
++    if (selector == kPanfrostWaitBO) {
++        IOLockLock(gMaliLock);
++        b = buffer(r.wait.handle);
++        uint64_t seq = b != NULL ? b->last_seq : 0;
++        IOLockUnlock(gMaliLock);
++        if (b == NULL) {
++            return kIOReturnNotFound;
++        }
++        ret = seq == 0 || dreamlte_mali_wait(seq, r.wait.timeout_ns > 0 ? (uint64_t)r.wait.timeout_ns : 0) ?
++              kIOReturnSuccess : kIOReturnTimeout;
++        if (args->structureOutput != NULL && args->structureOutputSize >= size) {
++            memcpy(args->structureOutput, &r, size);
++            args->structureOutputSize = (uint32_t)size;
++        }
++        return ret;
++    }
++
++    IOLockLock(gMaliLock);
++    if (fRequests++ < 32) {
++        IOLog("MaliGPU: request 0x%x, %zu bytes\n", selector, size);
++    }
++
++    switch (selector) {
++    case kPanfrostGetParam:
++        if (!dreamlte_mali_parameter(r.param.param, &r.param.value)) {
++            ret = kIOReturnBadArgument;
++        }
++        break;
++    case kPanfrostCreateBO: {
++        uint64_t size = round_page_64(r.create.size);
++        IOBufferMemoryDescriptor *memory;
++        struct mali_buffer *b;
++
++        if (size == 0 || size > MALI_BUFFER_MAX) {
++            ret = kIOReturnBadArgument;
++            break;
++        }
++        memory = IOBufferMemoryDescriptor::inTaskWithOptions(kernel_task,
++            kIODirectionInOut | kIOMemoryKernelUserShared | kIOMapWriteCombineCache,
++            (vm_size_t)size, PAGE_SIZE);
++        if (memory == NULL) {
++            IOLog("MaliGPU: no memory for buffer of %llu bytes\n", size);
++            ret = kIOReturnNoMemory;
++            break;
++        }
++
++        uint64_t address = dreamlte_mali_address(size, !(r.create.flags & PANFROST_BO_NOEXEC));
++        if (address == 0) {
++            memory->release();
++            ret = kIOReturnNoMemory;
++            break;
++        }
++
++        for (uint32_t n = 0; n < MALI_BUFFERS; n++) {
++            uint32_t i = (fNextBuffer + n) % MALI_BUFFERS;
++            if (fBuffers[i].memory == NULL) {
++                b = &fBuffers[i];
++                r.create.handle = i + 1;
++                fNextBuffer = i + 1;
++                break;
++            }
++        }
++        if (b == NULL) {
++            memory->release();
++            IOLog("MaliGPU: no handles left\n");
++            ret = kIOReturnNoMemory;
++            break;
++        }
++
++        bool mapped = true;
++        for (uint64_t offset = 0; offset < size && mapped; offset += 4096) {
++            IOByteCount length = 0;
++            addr64_t phys = memory->getPhysicalSegment(offset, &length, kIOMemoryMapperNone);
++            mapped = phys != 0 && dreamlte_mali_map(address + offset, phys);
++        }
++
++        if (!mapped) {
++            dreamlte_mali_unmap(address, size);
++            memory->release();
++            bzero(b, sizeof(*b));
++            IOLog("MaliGPU: buffer of %llu bytes cannot be mapped\n", size);
++            ret = kIOReturnNoMemory;
++            break;
++        }
++
++        dreamlte_mali_mapped();
++        b->memory = memory;
++        b->address = address;
++        b->size = size;
++        b->last_seq = 0;
++        r.create.offset = address;
++
++        if (gMaliBuffers < 32) {
++            gMaliMade[gMaliBuffers] = (struct mali_made){address, size, (uint32_t)size, r.create.flags};
++        }
++        OSIncrementAtomic((SInt32 *)&gMaliBuffers);
++        break;
++    }
++    case kPanfrostMmapBO:
++        ret = buffer(r.mmap.handle) != NULL ? kIOReturnSuccess : kIOReturnNotFound;
++        r.mmap.offset = (uint64_t)r.mmap.handle << 12;
++        break;
++    case kPanfrostGetBOOffset:
++        b = buffer(r.offset.handle);
++        ret = b != NULL ? kIOReturnSuccess : kIOReturnNotFound;
++        r.offset.offset = b != NULL ? b->address : 0;
++        break;
++    case kPanfrostSubmit: {
++        uint64_t seq = 0;
++        fSubmits++;
++        gMaliSubmits++;
++        if (r.submit.jc != 0) {
++            seq = dreamlte_mali_enqueue(r.submit.jc, r.submit.requirements & PANFROST_JD_REQ_FS);
++        }
++        for (uint32_t i = 0; seq != 0 && i < r.submit.bo_handle_count && i < 4096; i += 64) {
++            uint32_t handles[64];
++            uint32_t n = r.submit.bo_handle_count - i < 64 ? r.submit.bo_handle_count - i : 64;
++            if (copyin((user_addr_t)(r.submit.bo_handles + i * sizeof(uint32_t)), handles, n * sizeof(uint32_t)) != 0) {
++                break;
++            }
++            for (uint32_t k = 0; k < n; k++) {
++                b = buffer(handles[k]);
++                if (b != NULL) {
++                    b->last_seq = seq;
++                }
++            }
++        }
++        r.submit.jc = seq;
++        break;
++    }
++    case kPanfrostMadvise:
++        r.madvise.retained = 1;
++        break;
++    case kDrmGemClose:
++        b = buffer(r.close.handle);
++        if (b != NULL) {
++            freeBuffer(b);
++        } else {
++            ret = kIOReturnNotFound;
++        }
++        break;
++    default:
++        IOLog("MaliGPU: unknown request 0x%x (%zu bytes)\n", selector, size);
++        ret = kIOReturnUnsupported;
++        break;
++    }
++    IOLockUnlock(gMaliLock);
++
++    if (args->structureOutput != NULL && args->structureOutputSize >= size) {
++        memcpy(args->structureOutput, &r, size);
++        args->structureOutputSize = (uint32_t)size;
++    }
++    return ret;
++}
+diff --git a/iokit/Kernel/arm/MaliGPU.h b/iokit/Kernel/arm/MaliGPU.h
+new file mode 100644
+index 0000000..42cf1a9
+--- /dev/null
++++ b/iokit/Kernel/arm/MaliGPU.h
+@@ -0,0 +1,50 @@
++/*
++ * MaliGPU IOKit service header for Samsung Galaxy S8 (dreamlte)
++ * Adapted from Scion Project's HakiosMali
++ */
++
++#ifndef _IOKIT_MALIGPU_H
++#define _IOKIT_MALIGPU_H
++
++#include <IOKit/IOService.h>
++#include <IOKit/IOUserClient.h>
++#include <IOKit/IOBufferMemoryDescriptor.h>
++
++class MaliGPU : public IOService
++{
++    OSDeclareDefaultStructors(MaliGPU);
++
++public:
++    virtual bool start(IOService * provider) APPLE_KEXT_OVERRIDE;
++};
++
++#define MALI_BUFFERS 4096
++#define MALI_BUFFER_MAX (256ull << 20)
++
++struct mali_buffer {
++    IOMemoryDescriptor * memory;
++    void * surface;
++    uint64_t address, size;
++    uint64_t last_seq;
++};
++
++class MaliGPUUserClient : public IOUserClient
++{
++    OSDeclareDefaultStructors(MaliGPUUserClient);
++
++    struct mali_buffer * fBuffers;
++    uint32_t fNextBuffer;
++    uint32_t fSubmits, fFailed, fRequests;
++
++    struct mali_buffer * buffer(uint32_t handle);
++    void freeBuffer(struct mali_buffer * b);
++
++public:
++    virtual bool start(IOService * provider) APPLE_KEXT_OVERRIDE;
++    virtual IOReturn clientClose(void) APPLE_KEXT_OVERRIDE;
++    virtual void free(void) APPLE_KEXT_OVERRIDE;
++    virtual IOReturn clientMemoryForType(UInt32 type, IOOptionBits * options, IOMemoryDescriptor ** memory) APPLE_KEXT_OVERRIDE;
++    virtual IOReturn externalMethod(uint32_t selector, IOExternalMethodArguments * args, IOExternalMethodDispatch * dispatch, OSObject * target, void * reference) APPLE_KEXT_OVERRIDE;
++};
++
++#endif /* _IOKIT_MALIGPU_H */
+diff --git a/iokit/bsddev/IOKitBSDInit.cpp b/iokit/bsddev/IOKitBSDInit.cpp
+index b6ba676..c576dbb 100644
+--- a/iokit/bsddev/IOKitBSDInit.cpp
++++ b/iokit/bsddev/IOKitBSDInit.cpp
+@@ -71,6 +71,9 @@ extern boolean_t cpuid_vmm_present(void);
+ extern void a5xelte_emmc_probe(void);
+ extern void a5xelte_keys_init(void);
+ extern void a5xelte_touch_probe(void);
++extern void dreamlte_mali_init(void);
++extern bool dreamlte_mali_ready(void);
++extern void MaliGPUStart(void);
+ #endif
+ 
+ #define ROUNDUP(a, b) (((a) + ((b) - 1)) & (~((b) - 1)))
+@@ -774,6 +777,11 @@ IOFindBSDRoot( char * rootName, unsigned int rootNameSize,
+ #if defined(ARM64_BOARD_CONFIG_A5XELTE)
+ 	a5xelte_keys_init();
+ 	a5xelte_touch_probe();
++	/* Mali-G71 (boot-arg mali=N): bring the GPU up, and publish HakiosMali only if it got that far */
++	dreamlte_mali_init();
++	if (dreamlte_mali_ready()) {
++		MaliGPUStart();
++	}
+ 	{
+ 	uint32_t emmcprobe = 0;
+ 	PE_parse_boot_argn("emmcprobe", &emmcprobe, sizeof(emmcprobe));
+diff --git a/iokit/conf/files b/iokit/conf/files
+index 5fb0a52..d07c834 100644
+--- a/iokit/conf/files
++++ b/iokit/conf/files
+@@ -148,3 +148,4 @@ iokit/Kernel/IOWorkloadConfig.cpp			optional iokitcpp
+ 
+ # Skywalk
+ iokit/bsddev/skywalk/IOSkywalkSupport.cpp		optional iokitcpp skywalk
++iokit/Kernel/arm/MaliGPU.cpp			standard
 diff --git a/osfmk/arm64/dreamlte_mali.c b/osfmk/arm64/dreamlte_mali.c
 new file mode 100644
-index 0000000..0000000
+index 0000000..31003c9
 --- /dev/null
 +++ b/osfmk/arm64/dreamlte_mali.c
-@@ -0,0 +1,1200 @@
+@@ -0,0 +1,523 @@
 +/*
 + * Mali-G71 MP20 kernel driver for Samsung Galaxy S8 (Exynos 8895)
 + *
@@ -527,505 +1016,12 @@ index 0000000..0000000
 +#ifdef __cplusplus
 +}
 +#endif
-diff --git a/iokit/Kernel/arm/MaliGPU.h b/iokit/Kernel/arm/MaliGPU.h
-new file mode 100644
-index 0000000..0000000
---- /dev/null
-+++ b/iokit/Kernel/arm/MaliGPU.h
-@@ -0,0 +1,50 @@
-+/*
-+ * MaliGPU IOKit service header for Samsung Galaxy S8 (dreamlte)
-+ * Adapted from Scion Project's HakiosMali
-+ */
-+
-+#ifndef _IOKIT_MALIGPU_H
-+#define _IOKIT_MALIGPU_H
-+
-+#include <IOKit/IOService.h>
-+#include <IOKit/IOUserClient.h>
-+#include <IOKit/IOBufferMemoryDescriptor.h>
-+
-+class MaliGPU : public IOService
-+{
-+    OSDeclareDefaultStructors(MaliGPU);
-+
-+public:
-+    virtual bool start(IOService * provider) APPLE_KEXT_OVERRIDE;
-+};
-+
-+#define MALI_BUFFERS 4096
-+#define MALI_BUFFER_MAX (256ull << 20)
-+
-+struct mali_buffer {
-+    IOMemoryDescriptor * memory;
-+    void * surface;
-+    uint64_t address, size;
-+    uint64_t last_seq;
-+};
-+
-+class MaliGPUUserClient : public IOUserClient
-+{
-+    OSDeclareDefaultStructors(MaliGPUUserClient);
-+
-+    struct mali_buffer * fBuffers;
-+    uint32_t fNextBuffer;
-+    uint32_t fSubmits, fFailed, fRequests;
-+
-+    struct mali_buffer * buffer(uint32_t handle);
-+    void freeBuffer(struct mali_buffer * b);
-+
-+public:
-+    virtual bool start(IOService * provider) APPLE_KEXT_OVERRIDE;
-+    virtual IOReturn clientClose(void) APPLE_KEXT_OVERRIDE;
-+    virtual void free(void) APPLE_KEXT_OVERRIDE;
-+    virtual IOReturn clientMemoryForType(UInt32 type, IOOptionBits * options, IOMemoryDescriptor ** memory) APPLE_KEXT_OVERRIDE;
-+    virtual IOReturn externalMethod(uint32_t selector, IOExternalMethodArguments * args, IOExternalMethodDispatch * dispatch, OSObject * target, void * reference) APPLE_KEXT_OVERRIDE;
-+};
-+
-+#endif /* _IOKIT_MALIGPU_H */
-diff --git a/iokit/Kernel/arm/MaliGPU.cpp b/iokit/Kernel/arm/MaliGPU.cpp
-new file mode 100644
-index 0000000..0000000
---- /dev/null
-+++ b/iokit/Kernel/arm/MaliGPU.cpp
-@@ -0,0 +1,750 @@
-+/*
-+ * MaliGPU IOKit service for Samsung Galaxy S8 (dreamlte)
-+ * Adapted from Scion Project's HakiosMali (hakios.mali.cpp)
-+ * License: Apple Public Source License 2.0 (as original)
-+ */
-+
-+#include <IOKit/IOLib.h>
-+#include <IOKit/IOLocks.h>
-+#include <IOKit/IOKitKeys.h>
-+#include <IOKit/IOPlatformExpert.h>
-+#include <IOKit/IOService.h>
-+#include <IOKit/IOUserClient.h>
-+#include <IOKit/IOBufferMemoryDescriptor.h>
-+#include <IOKit/IOSubMemoryDescriptor.h>
-+#include <kern/clock.h>
-+#include <mach/mach_time.h>
-+#include <mach/vm_param.h>
-+#include <sys/systm.h>
-+#include <pexpert/pexpert.h>
-+
-+#include "MaliGPU.h"
-+
-+#ifdef __cplusplus
-+extern "C" {
-+#endif
-+
-+/* C kernel driver functions */
-+bool dreamlte_mali_ready(void);
-+bool dreamlte_mali_parameter(uint32_t which, uint64_t *value);
-+uint64_t dreamlte_mali_address(uint64_t size, bool executable);
-+bool dreamlte_mali_map(uint64_t gpu, uint64_t phys);
-+void dreamlte_mali_mapped(void);
-+void dreamlte_mali_unmap(uint64_t gpu, uint64_t size);
-+uint32_t dreamlte_mali_submit(uint64_t chain, bool fragment);
-+uint64_t dreamlte_mali_enqueue(uint64_t chain, bool fragment);
-+bool dreamlte_mali_wait(uint64_t seq, uint64_t timeout_ns);
-+void dreamlte_mali_init(void);
-+
-+void MaliGPUStart(void);
-+void FlushPoC_DcacheRegion(vm_offset_t va, size_t length);
-+
-+uint32_t gMaliClients, gMaliBuffers, gMaliSubmits, gMaliFailed, gMaliShown;
-+struct mali_made { uint64_t address, size; uint32_t asked, flags; };
-+struct mali_made gMaliMade[32];
-+
-+#ifdef __cplusplus
-+}
-+#endif
-+
-+/* Linux panfrost DRM API request numbers */
-+enum {
-+    kDrmGemClose            = 0x09,
-+    kPanfrostSubmit         = 0x40,
-+    kPanfrostWaitBO         = 0x41,
-+    kPanfrostCreateBO       = 0x42,
-+    kPanfrostMmapBO         = 0x43,
-+    kPanfrostGetParam       = 0x44,
-+    kPanfrostGetBOOffset    = 0x45,
-+    kPanfrostMadvise        = 0x48,
-+    kMaliGPUSurfaceSeq      = 0x7c,
-+    kMaliGPUWait            = 0x7d,
-+    kMaliGPUSurface         = 0x7e,
-+    kMaliGPUShow            = 0x7f,
-+};
-+
-+/* Panfrost DRM structures */
-+struct drm_gem_close {
-+    uint32_t handle, pad;
-+};
-+
-+struct drm_panfrost_submit {
-+    uint64_t jc;
-+    uint64_t in_syncs;
-+    uint32_t in_sync_count;
-+    uint32_t out_sync;
-+    uint64_t bo_handles;
-+    uint32_t bo_handle_count;
-+    uint32_t requirements;
-+};
-+#define PANFROST_JD_REQ_FS (1u << 0)
-+
-+struct drm_panfrost_wait_bo {
-+    uint32_t handle, pad;
-+    int64_t timeout_ns;
-+};
-+
-+struct drm_panfrost_create_bo {
-+    uint32_t size, flags, handle, pad;
-+    uint64_t offset;
-+};
-+#define PANFROST_BO_NOEXEC (1u << 0)
-+#define PANFROST_BO_HEAP (1u << 1)
-+
-+struct drm_panfrost_mmap_bo {
-+    uint32_t handle, flags;
-+    uint64_t offset;
-+};
-+
-+struct drm_panfrost_get_param {
-+    uint32_t param, pad;
-+    uint64_t value;
-+};
-+
-+struct drm_panfrost_get_bo_offset {
-+    uint32_t handle, pad;
-+    uint64_t offset;
-+};
-+
-+struct drm_panfrost_madvise {
-+    uint32_t handle, madv, retained;
-+};
-+
-+static IOLock *gMaliLock;
-+
-+OSDefineMetaClassAndStructors(MaliGPU, IOService);
-+
-+bool MaliGPU::start(IOService *provider) {
-+    if (!IOService::start(provider)) {
-+        return false;
-+    }
-+    setProperty(kIOUserClientClassKey, "MaliGPUUserClient");
-+    setName("HakiosMali");   /* userland looks for this name: hakios.drm.c, inject.c */
-+    registerService();
-+    return true;
-+}
-+
-+void MaliGPUStart(void) {
-+    IOService *provider = IOService::getPlatform();
-+    MaliGPU *gpu;
-+
-+    gMaliLock = IOLockAlloc();
-+    gpu = OSTypeAlloc(MaliGPU);
-+    if (gpu == NULL || provider == NULL || !gpu->init() || !gpu->attach(provider)) {
-+        OSSafeReleaseNULL(gpu);
-+        IOLog("HakiosMali: cannot create service\n");
-+        return;
-+    }
-+    if (!gpu->start(provider)) {
-+        gpu->detach(provider);
-+        IOLog("HakiosMali: service did not start\n");
-+    }
-+    gpu->release();
-+    IOLog("HakiosMali: Mali-G71 MP20 ready for programs\n");
-+}
-+
-+OSDefineMetaClassAndStructors(MaliGPUUserClient, IOUserClient);
-+
-+bool MaliGPUUserClient::start(IOService *provider) {
-+    if (!dreamlte_mali_ready() || !IOUserClient::start(provider)) {
-+        IOLog("MaliGPU: client could not start\n");
-+        return false;
-+    }
-+    IOLog("MaliGPU: client opened GPU\n");
-+    OSIncrementAtomic((SInt32 *)&gMaliClients);
-+    fBuffers = IONewZero(struct mali_buffer, MALI_BUFFERS);
-+    return fBuffers != NULL;
-+}
-+
-+struct mali_buffer *MaliGPUUserClient::buffer(uint32_t handle) {
-+    if (handle == 0 || handle > MALI_BUFFERS || fBuffers[handle - 1].memory == NULL) {
-+        return NULL;
-+    }
-+    return &fBuffers[handle - 1];
-+}
-+
-+void MaliGPUUserClient::freeBuffer(struct mali_buffer *b) {
-+    if (b->last_seq != 0) {
-+        (void)dreamlte_mali_wait(b->last_seq, 2ull * NSEC_PER_SEC);
-+    }
-+    dreamlte_mali_unmap(b->address, b->size);
-+    b->memory->release();
-+    bzero(b, sizeof(*b));
-+}
-+
-+IOReturn MaliGPUUserClient::clientClose(void) {
-+    IOLockLock(gMaliLock);
-+    for (uint32_t i = 0; fBuffers != NULL && i < MALI_BUFFERS; i++) {
-+        if (fBuffers[i].memory != NULL) {
-+            freeBuffer(&fBuffers[i]);
-+        }
-+    }
-+    IOLockUnlock(gMaliLock);
-+    if (fSubmits != 0) {
-+        IOLog("MaliGPU: client closed after %u job chains, %u failed\n", fSubmits, fFailed);
-+    }
-+    terminate();
-+    return kIOReturnSuccess;
-+}
-+
-+void MaliGPUUserClient::free(void) {
-+    if (fBuffers != NULL) {
-+        IODelete(fBuffers, struct mali_buffer, MALI_BUFFERS);
-+        fBuffers = NULL;
-+    }
-+    IOUserClient::free();
-+}
-+
-+IOReturn MaliGPUUserClient::clientMemoryForType(UInt32 type, IOOptionBits *options, IOMemoryDescriptor **memory) {
-+    struct mali_buffer *b;
-+    IOReturn ret = kIOReturnBadArgument;
-+
-+    IOLockLock(gMaliLock);
-+    b = buffer(type);
-+    if (b != NULL) {
-+        b->memory->retain();
-+        *memory = b->memory;
-+        *options = 0;
-+        ret = kIOReturnSuccess;
-+    }
-+    IOLockUnlock(gMaliLock);
-+    return ret;
-+}
-+
-+IOReturn MaliGPUUserClient::externalMethod(uint32_t selector, IOExternalMethodArguments *args,
-+    IOExternalMethodDispatch *dispatch, OSObject *target, void *reference) {
-+    union {
-+        struct drm_gem_close close;
-+        struct drm_panfrost_submit submit;
-+        struct drm_panfrost_wait_bo wait;
-+        struct drm_panfrost_create_bo create;
-+        struct drm_panfrost_mmap_bo mmap;
-+        struct drm_panfrost_get_param param;
-+        struct drm_panfrost_get_bo_offset offset;
-+        struct drm_panfrost_madvise madvise;
-+    } r;
-+    size_t size = args->structureInputSize;
-+    struct mali_buffer *b;
-+    IOReturn ret = kIOReturnSuccess;
-+
-+    if (args->structureInput == NULL || size > sizeof(r) || fBuffers == NULL) {
-+        return kIOReturnBadArgument;
-+    }
-+    if (!dreamlte_mali_ready()) {
-+        return kIOReturnNotReady;
-+    }
-+    bzero(&r, sizeof(r));
-+    memcpy(&r, args->structureInput, size);
-+
-+    if (selector == kPanfrostWaitBO) {
-+        IOLockLock(gMaliLock);
-+        b = buffer(r.wait.handle);
-+        uint64_t seq = b != NULL ? b->last_seq : 0;
-+        IOLockUnlock(gMaliLock);
-+        if (b == NULL) {
-+            return kIOReturnNotFound;
-+        }
-+        ret = seq == 0 || dreamlte_mali_wait(seq, r.wait.timeout_ns > 0 ? (uint64_t)r.wait.timeout_ns : 0) ?
-+              kIOReturnSuccess : kIOReturnTimeout;
-+        if (args->structureOutput != NULL && args->structureOutputSize >= size) {
-+            memcpy(args->structureOutput, &r, size);
-+            args->structureOutputSize = (uint32_t)size;
-+        }
-+        return ret;
-+    }
-+
-+    IOLockLock(gMaliLock);
-+    if (fRequests++ < 32) {
-+        IOLog("MaliGPU: request 0x%x, %zu bytes\n", selector, size);
-+    }
-+
-+    switch (selector) {
-+    case kPanfrostGetParam:
-+        if (!dreamlte_mali_parameter(r.param.param, &r.param.value)) {
-+            ret = kIOReturnBadArgument;
-+        }
-+        break;
-+    case kPanfrostCreateBO: {
-+        uint64_t size = round_page_64(r.create.size);
-+        IOBufferMemoryDescriptor *memory;
-+        struct mali_buffer *b;
-+
-+        if (size == 0 || size > MALI_BUFFER_MAX) {
-+            ret = kIOReturnBadArgument;
-+            break;
-+        }
-+        memory = IOBufferMemoryDescriptor::inTaskWithOptions(kernel_task,
-+            kIODirectionInOut | kIOMemoryKernelUserShared | kIOMapWriteCombineCache,
-+            (vm_size_t)size, PAGE_SIZE);
-+        if (memory == NULL) {
-+            IOLog("MaliGPU: no memory for buffer of %llu bytes\n", size);
-+            ret = kIOReturnNoMemory;
-+            break;
-+        }
-+
-+        uint64_t address = dreamlte_mali_address(size, !(r.create.flags & PANFROST_BO_NOEXEC));
-+        if (address == 0) {
-+            memory->release();
-+            ret = kIOReturnNoMemory;
-+            break;
-+        }
-+
-+        for (uint32_t n = 0; n < MALI_BUFFERS; n++) {
-+            uint32_t i = (fNextBuffer + n) % MALI_BUFFERS;
-+            if (fBuffers[i].memory == NULL) {
-+                b = &fBuffers[i];
-+                r.create.handle = i + 1;
-+                fNextBuffer = i + 1;
-+                break;
-+            }
-+        }
-+        if (b == NULL) {
-+            memory->release();
-+            IOLog("MaliGPU: no handles left\n");
-+            ret = kIOReturnNoMemory;
-+            break;
-+        }
-+
-+        bool mapped = true;
-+        for (uint64_t offset = 0; offset < size && mapped; offset += 4096) {
-+            IOByteCount length = 0;
-+            addr64_t phys = memory->getPhysicalSegment(offset, &length, kIOMemoryMapperNone);
-+            mapped = phys != 0 && dreamlte_mali_map(address + offset, phys);
-+        }
-+
-+        if (!mapped) {
-+            dreamlte_mali_unmap(address, size);
-+            memory->release();
-+            bzero(b, sizeof(*b));
-+            IOLog("MaliGPU: buffer of %llu bytes cannot be mapped\n", size);
-+            ret = kIOReturnNoMemory;
-+            break;
-+        }
-+
-+        dreamlte_mali_mapped();
-+        b->memory = memory;
-+        b->address = address;
-+        b->size = size;
-+        b->last_seq = 0;
-+        r.create.offset = address;
-+
-+        if (gMaliBuffers < 32) {
-+            gMaliMade[gMaliBuffers] = (struct mali_made){address, size, (uint32_t)size, r.create.flags};
-+        }
-+        OSIncrementAtomic((SInt32 *)&gMaliBuffers);
-+        break;
-+    }
-+    case kPanfrostMmapBO:
-+        ret = buffer(r.mmap.handle) != NULL ? kIOReturnSuccess : kIOReturnNotFound;
-+        r.mmap.offset = (uint64_t)r.mmap.handle << 12;
-+        break;
-+    case kPanfrostGetBOOffset:
-+        b = buffer(r.offset.handle);
-+        ret = b != NULL ? kIOReturnSuccess : kIOReturnNotFound;
-+        r.offset.offset = b != NULL ? b->address : 0;
-+        break;
-+    case kPanfrostSubmit: {
-+        uint64_t seq = 0;
-+        fSubmits++;
-+        gMaliSubmits++;
-+        if (r.submit.jc != 0) {
-+            seq = dreamlte_mali_enqueue(r.submit.jc, r.submit.requirements & PANFROST_JD_REQ_FS);
-+        }
-+        for (uint32_t i = 0; seq != 0 && i < r.submit.bo_handle_count && i < 4096; i += 64) {
-+            uint32_t handles[64];
-+            uint32_t n = r.submit.bo_handle_count - i < 64 ? r.submit.bo_handle_count - i : 64;
-+            if (copyin((user_addr_t)(r.submit.bo_handles + i * sizeof(uint32_t)), handles, n * sizeof(uint32_t)) != 0) {
-+                break;
-+            }
-+            for (uint32_t k = 0; k < n; k++) {
-+                b = buffer(handles[k]);
-+                if (b != NULL) {
-+                    b->last_seq = seq;
-+                }
-+            }
-+        }
-+        r.submit.jc = seq;
-+        break;
-+    }
-+    case kPanfrostMadvise:
-+        r.madvise.retained = 1;
-+        break;
-+    case kDrmGemClose:
-+        b = buffer(r.close.handle);
-+        if (b != NULL) {
-+            freeBuffer(b);
-+        } else {
-+            ret = kIOReturnNotFound;
-+        }
-+        break;
-+    default:
-+        IOLog("MaliGPU: unknown request 0x%x (%zu bytes)\n", selector, size);
-+        ret = kIOReturnUnsupported;
-+        break;
-+    }
-+    IOLockUnlock(gMaliLock);
-+
-+    if (args->structureOutput != NULL && args->structureOutputSize >= size) {
-+        memcpy(args->structureOutput, &r, size);
-+        args->structureOutputSize = (uint32_t)size;
-+    }
-+    return ret;
-+}
 diff --git a/osfmk/conf/files.arm64 b/osfmk/conf/files.arm64
-index 0000000..0000000
+index b0dad49..c9f35f2 100644
 --- a/osfmk/conf/files.arm64
 +++ b/osfmk/conf/files.arm64
-@@ -1,3 +1,4 @@
-+osfmk/arm64/dreamlte_mali.c                 optional config_dreamlte
- osfmk/arm64/start.s                         standard
- osfmk/arm64/locore.s                        standard
- osfmk/arm64/lowmem_vectors.c                standard
-diff --git a/iokit/conf/files b/iokit/conf/files
-index 0000000..0000000
---- a/iokit/conf/files
-+++ b/iokit/conf/files
-@@ -1,3 +1,4 @@
-+iokit/Kernel/arm/MaliGPU.cpp                optional config_dreamlte
- iokit/Kernel/IOCatalogue.cpp                standard
- iokit/Kernel/IOCommandGate.cpp              standard
- iokit/Kernel/IOCommandPool.cpp              standard
-
-
-diff --git a/iokit/bsddev/IOKitBSDInit.cpp b/iokit/bsddev/IOKitBSDInit.cpp
-index b6ba676..8626e0f 100644
---- a/iokit/bsddev/IOKitBSDInit.cpp
-+++ b/iokit/bsddev/IOKitBSDInit.cpp
-@@ -71,6 +71,10 @@ extern boolean_t cpuid_vmm_present(void);
- extern void a5xelte_emmc_probe(void);
- extern void a5xelte_keys_init(void);
- extern void a5xelte_touch_probe(void);
-+#if defined(DREAMLTE)
-+extern void dreamlte_mali_init(void);
-+extern void MaliGPUStart(void);
-+#endif
- #endif
+@@ -105,3 +105,4 @@ osfmk/arm64/machine_remote_time.c optional config_mach_bridge_recv_time
+ osfmk/arm64/corecrypto/sha256_compress_arm64.s	standard
  
- #define ROUNDUP(a, b) (((a) + ((b) - 1)) & (~((b) - 1)))
-@@ -774,6 +778,12 @@ IOFindBSDRoot( char * rootName, unsigned int rootNameSize,
- #if defined(ARM64_BOARD_CONFIG_A5XELTE)
- 	a5xelte_keys_init();
- 	a5xelte_touch_probe();
-+#if defined(DREAMLTE)
-+	/* Initialize Mali-G71 MP20 GPU hardware (step 1-6 in kernel) */
-+	dreamlte_mali_init();
-+	/* Register HakiosMali IOKit service (step 7-8 in IOKit) */
-+	MaliGPUStart();
-+#endif
- 	{
- 	uint32_t emmcprobe = 0;
- 	PE_parse_boot_argn("emmcprobe", &emmcprobe, sizeof(emmcprobe));
+ osfmk/arm/counter.c	standard
++osfmk/arm64/dreamlte_mali.c			standard
