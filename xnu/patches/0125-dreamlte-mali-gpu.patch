@@ -756,6 +756,24 @@ index 0000000..8462204
 +};
 +
 +#endif /* _IOKIT_MALIGPU_H */
+diff --git a/iokit/bsddev/IOKitBSDInit.cpp b/iokit/bsddev/IOKitBSDInit.cpp
+index b6ba676..83c75c3 100644
+--- a/iokit/bsddev/IOKitBSDInit.cpp
++++ b/iokit/bsddev/IOKitBSDInit.cpp
+@@ -774,6 +774,13 @@ IOFindBSDRoot( char * rootName, unsigned int rootNameSize,
+ #if defined(ARM64_BOARD_CONFIG_A5XELTE)
+ 	a5xelte_keys_init();
+ 	a5xelte_touch_probe();
++	{
++		extern "C" void dreamlte_mali_init(void);
++		extern "C" bool dreamlte_mali_ready(void);
++		extern void HakiosMaliStart(void);
++		dreamlte_mali_init();
++		if (dreamlte_mali_ready()) HakiosMaliStart();
++	}
+ 	{
+ 	uint32_t emmcprobe = 0;
+ 	PE_parse_boot_argn("emmcprobe", &emmcprobe, sizeof(emmcprobe));
 diff --git a/osfmk/arm64/dreamlte_mali.c b/osfmk/arm64/dreamlte_mali.c
 new file mode 100644
 index 0000000..83b0f8b
