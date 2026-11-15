@@ -710,7 +710,7 @@ index 0000000..0000000
 +        return false;
 +    }
 +    setProperty(kIOUserClientClassKey, "MaliGPUUserClient");
-+    setName("MaliGPU");
++    setName("HakiosMali");   /* userland looks for this name: hakios.drm.c, inject.c */
 +    registerService();
 +    return true;
 +}
@@ -723,15 +723,15 @@ index 0000000..0000000
 +    gpu = OSTypeAlloc(MaliGPU);
 +    if (gpu == NULL || provider == NULL || !gpu->init() || !gpu->attach(provider)) {
 +        OSSafeReleaseNULL(gpu);
-+        IOLog("MaliGPU: cannot create service\n");
++        IOLog("HakiosMali: cannot create service\n");
 +        return;
 +    }
 +    if (!gpu->start(provider)) {
 +        gpu->detach(provider);
-+        IOLog("MaliGPU: service did not start\n");
++        IOLog("HakiosMali: service did not start\n");
 +    }
 +    gpu->release();
-+    IOLog("MaliGPU: Mali-G71 MP20 ready for programs\n");
++    IOLog("HakiosMali: Mali-G71 MP20 ready for programs\n");
 +}
 +
 +OSDefineMetaClassAndStructors(MaliGPUUserClient, IOUserClient);

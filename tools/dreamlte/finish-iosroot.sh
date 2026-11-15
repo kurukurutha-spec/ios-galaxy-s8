@@ -38,6 +38,25 @@ python3 "$here/sweet-root-tweaks.py" "$mnt"
 test -f "$mnt/sbin/launchd"
 test -f "$mnt/System/Library/CoreServices/SpringBoard.app/SpringBoard"
 test -f "$mnt/System/Library/Caches/com.apple.dyld/dyld_shared_cache_arm64"
+
+# Install Scion GPU libraries for Mali (HakiosMali IOKit service).
+# backboardd's libhakios.dylib detects "HakiosMali" via IOServiceMatching and
+# calls dlopen("/redwood/lib/libhakios.gl.dylib"), which links libOSMesa.8.dylib.
+# libhakiosair.dylib is the Metal/AIR path — copied only when present.
+# Source: scion-kernel/userland/build.sh (GL=1 path, root/lib/ staging).
+SCION_LIB=/home/flex5/hackios/scion/scion-kernel/userland/root/lib
+if [ -d "$SCION_LIB" ]; then
+    REDWOOD="$mnt/redwood/lib"
+    mkdir -p "$REDWOOD"
+    for lib in libhakios.gl.dylib libOSMesa.8.dylib libhakiosair.dylib; do
+        if [ -f "$SCION_LIB/$lib" ]; then
+            install -m 0755 "$SCION_LIB/$lib" "$REDWOOD/$lib"
+            echo "finish-iosroot: installed $lib -> /redwood/lib/"
+        fi
+    done
+else
+    echo "finish-iosroot: warning: $SCION_LIB not found; build Scion userland with GL=1 first"
+fi
 df -h "$mnt"
 sync
 umount "$mnt"
