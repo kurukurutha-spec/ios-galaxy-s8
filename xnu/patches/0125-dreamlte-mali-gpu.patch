@@ -793,10 +793,10 @@ index acc9ae0..ccfee89 100644
 +iokit/Kernel/arm/MaliGPU.cpp optional iokitcpp
 diff --git a/osfmk/arm64/dreamlte_mali.c b/osfmk/arm64/dreamlte_mali.c
 new file mode 100644
-index 0000000..b833d53
+index 0000000..2df9bf2
 --- /dev/null
 +++ b/osfmk/arm64/dreamlte_mali.c
-@@ -0,0 +1,954 @@
+@@ -0,0 +1,950 @@
 +/*
 + * Mali-G71 MP20 kernel driver for Samsung Galaxy S8 (Exynos 8895)
 + *
@@ -819,8 +819,6 @@ index 0000000..b833d53
 +#include <mach/mach_time.h>
 +#include <mach/mach_types.h>
 +#include <arm/pmap.h>
-+extern pmap_paddr_t kvtophys(vm_offset_t addr);
-+extern vm_offset_t phystokv(map_paddr_t pa);
 +
 +/* osfmk cannot take <sys/systm.h>: it redefines daddr_t, dev_t, clock_t */
 +extern int printf(const char *, ...);
@@ -1244,12 +1242,10 @@ index 0000000..b833d53
 +	}
 +}
 +
++/*
 + * Waits for a job without keeping a core busy: a short poll, then sleeps of mali_nap_us at a time. The wait used to
 + * spin (delay(10) in a loop) for as long as the GPU worked, which took a whole core of the four during each frame.
 + */
-+static int mali_wait_event;
-+static uint32_t mali_nap_us = 50;       /* boot-arg mali_nap_us (10 to 1000) */
-+static LCK_MTX_DECLARE(mali_wait_lock, &mali_lock_group);
 +
 +static bool
 +wait_job(uint32_t at, uint32_t mask, uint32_t want, uint32_t ms)
