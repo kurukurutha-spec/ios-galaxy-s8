@@ -781,6 +781,16 @@ index b6ba676..5772807 100644
  	{
  	uint32_t emmcprobe = 0;
  	PE_parse_boot_argn("emmcprobe", &emmcprobe, sizeof(emmcprobe));
+diff --git a/iokit/conf/files.arm64 b/iokit/conf/files.arm64
+index acc9ae0..ccfee89 100644
+--- a/iokit/conf/files.arm64
++++ b/iokit/conf/files.arm64
+@@ -20,3 +20,5 @@ iokit/Kernel/arm/hid/SweetHID.cpp                                optional iokitc
+ iokit/Kernel/arm/hid/IOHIDEvent.cpp                              optional iokitcpp
+ iokit/Kernel/arm/hid/IOHIDEventServiceQueue.cpp                  optional iokitcpp
+ iokit/Kernel/arm/hid/IOHIDEventServiceUserClient.cpp             optional iokitcpp
++
++iokit/Kernel/arm/MaliGPU.cpp optional iokitcpp
 diff --git a/osfmk/arm64/dreamlte_mali.c b/osfmk/arm64/dreamlte_mali.c
 new file mode 100644
 index 0000000..b833d53
@@ -1885,3 +1895,13 @@ index 0000000..337af76
 +}
 +
 +#endif /* HAKIOS_MALI_VA_H */
+diff --git a/osfmk/conf/files.arm64 b/osfmk/conf/files.arm64
+index b0dad49..b24dbca 100644
+--- a/osfmk/conf/files.arm64
++++ b/osfmk/conf/files.arm64
+@@ -105,3 +105,5 @@ osfmk/arm64/machine_remote_time.c optional config_mach_bridge_recv_time
+ osfmk/arm64/corecrypto/sha256_compress_arm64.s	standard
+ 
+ osfmk/arm/counter.c	standard
++
++osfmk/arm64/dreamlte_mali.c optional config_a5xelte
