@@ -1,6 +1,6 @@
 diff --git a/iokit/Kernel/arm/MaliGPU.cpp b/iokit/Kernel/arm/MaliGPU.cpp
 new file mode 100644
-index 0000000..b1bad05
+index 0000000..d2b5236
 --- /dev/null
 +++ b/iokit/Kernel/arm/MaliGPU.cpp
 @@ -0,0 +1,710 @@
@@ -220,7 +220,7 @@ index 0000000..b1bad05
 +bool
 +HakiosMaliDrawn(SweetSurface * surface, uint64_t milliseconds)
 +{
-+	uint64_t interval, now, left = 0;
++	uint64_t interval, deadline, now, left = 0, seq = 0;
 +
 +	if (!dreamlte_mali_ready()) {
 +		return true;
