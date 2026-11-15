@@ -786,10 +786,10 @@ index b6ba676..05561a2 100644
  	PE_parse_boot_argn("emmcprobe", &emmcprobe, sizeof(emmcprobe));
 diff --git a/osfmk/arm64/dreamlte_mali.c b/osfmk/arm64/dreamlte_mali.c
 new file mode 100644
-index 0000000..83b0f8b
+index 0000000..b833d53
 --- /dev/null
 +++ b/osfmk/arm64/dreamlte_mali.c
-@@ -0,0 +1,952 @@
+@@ -0,0 +1,954 @@
 +/*
 + * Mali-G71 MP20 kernel driver for Samsung Galaxy S8 (Exynos 8895)
 + *
@@ -811,7 +811,9 @@ index 0000000..83b0f8b
 +#include <kern/thread.h>
 +#include <mach/mach_time.h>
 +#include <mach/mach_types.h>
-+#include <arm/pmap/pmap.h>	/* kvtophys, phystokv: not reached through <vm/pmap.h> */
++#include <arm/pmap.h>
++extern pmap_paddr_t kvtophys(vm_offset_t addr);
++extern vm_offset_t phystokv(map_paddr_t pa);
 +
 +/* osfmk cannot take <sys/systm.h>: it redefines daddr_t, dev_t, clock_t */
 +extern int printf(const char *, ...);
