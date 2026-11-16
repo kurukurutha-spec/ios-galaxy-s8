@@ -793,7 +793,7 @@ index acc9ae0..ccfee89 100644
 +iokit/Kernel/arm/MaliGPU.cpp optional iokitcpp
 diff --git a/osfmk/arm64/dreamlte_mali.c b/osfmk/arm64/dreamlte_mali.c
 new file mode 100644
-index 0000000..2df9bf2
+index 0000000..7f3515d
 --- /dev/null
 +++ b/osfmk/arm64/dreamlte_mali.c
 @@ -0,0 +1,950 @@
@@ -1127,9 +1127,9 @@ index 0000000..2df9bf2
 +}
 +
 +
-+uint32_t gMaliClients, gMaliBuffers, gMaliSubmits, gMaliFailed, gMaliShown;
++extern uint32_t gMaliClients, gMaliBuffers, gMaliSubmits, gMaliFailed, gMaliShown;
 +struct mali_made { uint64_t address, size; uint32_t asked, flags; };
-+struct mali_made gMaliMade[32];
++extern struct mali_made gMaliMade[32];
 +
 +
 +
